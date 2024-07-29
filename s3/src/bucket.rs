@@ -1,5 +1,6 @@
 #[cfg(feature = "blocking")]
 use block_on_proc::block_on;
+use futures::FutureExt;
 #[cfg(feature = "tags")]
 use minidom::Element;
 use std::collections::HashMap;
@@ -1203,14 +1204,15 @@ impl Bucket {
         part_number: u32,
         upload_id: &str,
         content_type: &str,
-    ) -> Result<ResponseData, S3Error> {
+    ) -> Result<(u32, ResponseData), S3Error> {
         let command = Command::PutObject {
             content: &chunk,
             multipart: Some(Multipart::new(part_number, upload_id)), // upload_id: &msg.upload_id,
             content_type,
         };
         let request = RequestImpl::new(self, path, command).await?;
-        request.response_data(true).await
+        let response = request.response_data(true).await?;
+        Ok((part_number, response))
     }
 
     #[maybe_async::async_impl]
@@ -1244,7 +1246,7 @@ impl Bucket {
         let upload_id = &msg.upload_id;
 
         let mut part_number: u32 = 0;
-        let mut etags = Vec::new();
+        let mut etags: HashMap<u32, String> = HashMap::new();
 
         // Collect request handles
         let mut handles = vec![];
@@ -1261,16 +1263,39 @@ impl Bucket {
 
             // Start chunk upload
             part_number += 1;
-            handles.push(self.make_multipart_request(
-                &path,
-                chunk,
-                part_number,
-                upload_id,
-                content_type,
-            ));
+            handles.push(
+                self.make_multipart_request(&path, chunk, part_number, upload_id, content_type)
+                    .boxed(),
+            );
 
             if done {
                 break;
+            }
+
+            // Don't start too many uploads at once. This would read the whole file
+            // into memory. Also, connections may be interrupted when we start too many.
+            if handles.len() >= 3 {
+                let (response, _, remaining) = futures::future::select_all(handles).await;
+                handles = remaining;
+
+                let (current_part, response_data) = response?;
+                if !(200..300).contains(&response_data.status_code()) {
+                    // wait until other pending chunks are finished
+                    futures::future::join_all(handles).await;
+
+                    // if chunk upload failed - abort the upload
+                    match self.abort_upload(&path, upload_id).await {
+                        Ok(_) => {
+                            return Err(error_from_response_data(response_data)?);
+                        }
+                        Err(error) => {
+                            return Err(error);
+                        }
+                    }
+                }
+
+                let etag = response_data.as_str()?;
+                etags.insert(current_part, etag.to_string());
             }
         }
 
@@ -1278,7 +1303,7 @@ impl Bucket {
         let responses = futures::future::join_all(handles).await;
 
         for response in responses {
-            let response_data = response?;
+            let (current_part, response_data) = response?;
             if !(200..300).contains(&response_data.status_code()) {
                 // if chunk upload failed - abort the upload
                 match self.abort_upload(&path, upload_id).await {
@@ -1292,17 +1317,14 @@ impl Bucket {
             }
 
             let etag = response_data.as_str()?;
-            etags.push(etag.to_string());
+            etags.insert(current_part, etag.to_string());
         }
 
         // Finish the upload
-        let inner_data = etags
-            .clone()
-            .into_iter()
-            .enumerate()
-            .map(|(i, x)| Part {
-                etag: x,
-                part_number: i as u32 + 1,
+        let inner_data = (1..=part_number)
+            .map(|i| Part {
+                etag: etags.get(&i).unwrap().clone(),
+                part_number: i,
             })
             .collect::<Vec<Part>>();
         let response_data = self
